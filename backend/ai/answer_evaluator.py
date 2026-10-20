@@ -1,420 +1,191 @@
-from backend.ai.question_bank import get_question
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+"""
+Content evaluation of a transcribed answer.
+
+Signals (all 0-100, see docs/SCORING.md):
+
+* Topic relevance: cosine similarity between the question and the answer
+  embeddings (all-MiniLM-L6-v2). It measures how on-topic the answer is,
+  not whether it is correct. It is uncalibrated: there is no human-rated
+  data mapping similarity values to answer quality.
+* Concept coverage: per expected concept, 100 if an evidence phrase occurs
+  as whole words, otherwise min(similarity x 100, 70) if the best
+  alias-to-sentence similarity is at least 0.50, else 0. Averaged over
+  concepts.
+* Similarity to a reference answer: only when the question has one
+  (none do yet). Reported separately and not part of the answer score.
+
+These are heuristics. Semantic similarity is not evidence of technical
+correctness, completeness or sound reasoning.
+"""
+
+from __future__ import annotations
+
+import logging
 import re
+from typing import Callable, Optional, Protocol, Sequence
+
+import numpy as np
+
+from backend.ai.question_bank import Question
+from backend.core.results import AnswerResult, Metric, Status, round_half_up
+from backend.scoring.scoring_engine import answer_score, clamp_0_100
+
+log = logging.getLogger(__name__)
+
+SEMANTIC_THRESHOLD = 0.50
+SEMANTIC_ONLY_CAP = 70
 
 
-# --------------------------------------------------
-# Load semantic model ONCE
-# --------------------------------------------------
-
-print("Loading semantic evaluation model...")
-
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-print("Semantic model loaded!")
+class Encoder(Protocol):
+    def encode(self, sentences: Sequence[str], normalize_embeddings: bool = ...) -> np.ndarray:
+        ...
 
 
-# --------------------------------------------------
-# Utility: convert similarity to 0-100
-# --------------------------------------------------
-
-def similarity_to_score(similarity):
-    """
-    Convert cosine similarity into a safe 0-100 score.
-    """
-
-    similarity = max(0.0, min(1.0, float(similarity)))
-
-    return round(similarity * 100)
+def similarity_to_score(similarity: float) -> float:
+    """Map a cosine similarity to 0-100 by clamping to [0, 1] and scaling."""
+    return clamp_0_100(max(0.0, min(1.0, float(similarity))) * 100.0)
 
 
-# --------------------------------------------------
-# Semantic similarity
-# --------------------------------------------------
-
-def semantic_similarity(text1, text2):
-    """
-    Calculate semantic similarity between two texts.
-    """
-
-    if not text1 or not text2:
-        return 0.0
-
-    embeddings = model.encode(
-        [text1, text2],
-        normalize_embeddings=True
-    )
-
-    similarity = cosine_similarity(
-        [embeddings[0]],
-        [embeddings[1]]
-    )[0][0]
-
-    return float(similarity)
+def split_sentences(text: str) -> list[str]:
+    return [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
 
 
-# --------------------------------------------------
-# Split answer into sentences
-# --------------------------------------------------
-
-def split_sentences(text):
-    """
-    Split an answer into individual sentences.
-    """
-
-    sentences = re.split(
-        r"[.!?]+",
-        text
-    )
-
-    return [
-        sentence.strip()
-        for sentence in sentences
-        if sentence.strip()
-    ]
+def _normalise(text: str) -> str:
+    """Lower-case and treat hyphens/underscores as spaces."""
+    text = text.lower().replace("-", " ").replace("_", " ")
+    return re.sub(r"\s+", " ", text).strip()
 
 
-# --------------------------------------------------
-# Concept coverage
-# --------------------------------------------------
-def concept_coverage(answer, expected_concepts):
-    """
-    Evaluate whether the candidate actually demonstrates
-    each expected concept.
+def contains_phrase(text: str, phrase: str) -> bool:
+    """Whole-word, case-insensitive phrase match ("L1" does not match "L10")."""
+    norm_phrase = _normalise(phrase)
+    if not norm_phrase:
+        return False
+    pattern = r"(?<!\w)" + re.escape(norm_phrase) + r"(?!\w)"
+    return re.search(pattern, _normalise(text)) is not None
 
-    Evidence phrases provide explicit concept evidence.
-    Semantic similarity helps recognize paraphrases.
-    """
 
-    if not answer or not answer.strip():
-        return {
-            "coverage_score": 0,
-            "concept_scores": {}
-        }
+def _cosine_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    a = a / np.clip(np.linalg.norm(a, axis=1, keepdims=True), 1e-12, None)
+    b = b / np.clip(np.linalg.norm(b, axis=1, keepdims=True), 1e-12, None)
+    return a @ b.T
 
-    answer_lower = answer.lower()
 
-    sentences = split_sentences(answer)
+def feedback_for(score: float) -> str:
+    if score >= 85:
+        return ("Clear answer that addressed the question and covered the "
+                "expected concepts.")
+    if score >= 70:
+        return ("You addressed the main idea; some expected concepts could be "
+                "explained in more detail.")
+    if score >= 50:
+        return "Partly relevant answer. Try to explain the key concepts more directly."
+    return "Focus on the specific concepts the question asks about."
 
-    if not sentences:
-        return {
-            "coverage_score": 0,
-            "concept_scores": {}
-        }
 
-    sentence_embeddings = model.encode(
-        sentences,
-        normalize_embeddings=True
-    )
+class AnswerEvaluator:
+    """Evaluates answers with a sentence-embedding model."""
 
-    concept_scores = {}
+    def __init__(self, encoder_provider: Callable[[], Encoder]) -> None:
+        # A provider (not the encoder itself) so the model loads lazily and
+        # load failures surface as an evaluation failure.
+        self._encoder_provider = encoder_provider
 
-    # Semantic threshold used only as supporting evidence
-    SEMANTIC_THRESHOLD = 0.50
+    def _encode(self, texts: Sequence[str]) -> np.ndarray:
+        encoder = self._encoder_provider()
+        vectors = np.asarray(encoder.encode(list(texts), normalize_embeddings=True))
+        if vectors.ndim != 2 or vectors.shape[0] != len(texts):
+            raise ValueError(f"Encoder returned shape {vectors.shape} for {len(texts)} texts")
+        if not np.all(np.isfinite(vectors)):
+            raise ValueError("Encoder returned non-finite values")
+        return vectors
 
-    for concept in expected_concepts:
+    def concept_coverage(self, answer: str, question: Question) -> tuple[float, dict[str, int]]:
+        sentences = split_sentences(answer)
+        if not sentences:
+            return 0.0, {c.name: 0 for c in question.concepts}
 
-        name = concept["name"]
-        aliases = concept["aliases"]
-        evidence = concept.get("evidence", [])
+        need_semantic = [
+            c for c in question.concepts
+            if not any(contains_phrase(answer, p) for p in c.evidence)
+        ]
+        phrase_vectors: dict[str, np.ndarray] = {}
+        if need_semantic:
+            phrases = [p for c in need_semantic for p in (c.name, *c.aliases)]
+            vectors = self._encode(list(sentences) + phrases)
+            sentence_vecs, phrase_vecs = vectors[: len(sentences)], vectors[len(sentences):]
+            offset = 0
+            for c in need_semantic:
+                n = 1 + len(c.aliases)
+                phrase_vectors[c.name] = phrase_vecs[offset: offset + n]
+                offset += n
+        scores: dict[str, int] = {}
+        for c in question.concepts:
+            if c.name not in phrase_vectors:
+                scores[c.name] = 100
+                continue
+            best = float(_cosine_matrix(phrase_vectors[c.name], sentence_vecs).max())
+            if best >= SEMANTIC_THRESHOLD:
+                scores[c.name] = min(round_half_up(similarity_to_score(best)), SEMANTIC_ONLY_CAP)
+            else:
+                scores[c.name] = 0
+        coverage = sum(scores.values()) / len(scores) if scores else 0.0
+        return clamp_0_100(coverage), scores
 
-        # ------------------------------------------
-        # STEP 1: Explicit evidence
-        # ------------------------------------------
-
-        explicit_match = False
-
-        for phrase in evidence:
-
-            if phrase.lower() in answer_lower:
-                explicit_match = True
-                break
-
-        if explicit_match:
-            concept_scores[name] = 100
-            continue
-
-        # ------------------------------------------
-        # STEP 2: Semantic paraphrase matching
-        # ------------------------------------------
-
-        phrases = [name] + aliases
-
-        best_similarity = 0.0
-
-        for phrase in phrases:
-
-            phrase_embedding = model.encode(
-                [phrase],
-                normalize_embeddings=True
+    def evaluate(self, question: Question, transcript: Optional[str]) -> AnswerResult:
+        text = (transcript or "").strip()
+        if not re.search(r"\w", text):
+            reason = "No words were recognised in the recording"
+            return AnswerResult(
+                status=Status.UNAVAILABLE,
+                reason=reason,
+                relevance=Metric.unavailable("Topic relevance", reason),
+                coverage=Metric.unavailable("Concept coverage", reason),
+                answer_score=Metric.unavailable("Answer content", reason),
+            )
+        try:
+            q_vec, a_vec = self._encode([question.text, text])
+            relevance_value = similarity_to_score(float(_cosine_matrix(q_vec[None], a_vec[None])[0, 0]))
+            coverage_value, concept_scores = self.concept_coverage(text, question)
+            reference = Metric.unavailable(
+                "Similarity to reference answer", "No reference answer for this question"
+            )
+            if question.reference_answer:
+                r_vec, a2 = self._encode([question.reference_answer, text])
+                reference = Metric.available(
+                    "Similarity to reference answer",
+                    similarity_to_score(float(_cosine_matrix(r_vec[None], a2[None])[0, 0])),
+                )
+        except Exception as exc:  # noqa: BLE001 - reported as a failed metric
+            log.exception("Answer evaluation failed")
+            reason = f"Answer evaluation failed ({type(exc).__name__})"
+            return AnswerResult(
+                status=Status.FAILED,
+                reason=reason,
+                relevance=Metric.failed("Topic relevance", reason),
+                coverage=Metric.failed("Concept coverage", reason),
+                answer_score=Metric.failed("Answer content", reason),
             )
 
-            similarities = cosine_similarity(
-                phrase_embedding,
-                sentence_embeddings
-            )[0]
-
-            best_similarity = max(
-                best_similarity,
-                max(similarities)
-            )
-
-        # ------------------------------------------
-        # STEP 3: Partial semantic evidence
-        # ------------------------------------------
-
-        if best_similarity >= SEMANTIC_THRESHOLD:
-
-            score = similarity_to_score(
-                best_similarity
-            )
-
-            # Don't allow semantic-only matching
-            # to look like perfect explicit evidence.
-            score = min(score, 70)
-
-        else:
-
-            score = 0
-
-        concept_scores[name] = score
-
-    # ------------------------------------------
-    # Overall concept coverage
-    # ------------------------------------------
-
-    if concept_scores:
-
-        coverage_score = round(
-            sum(concept_scores.values())
-            / len(concept_scores)
+        relevance = Metric.available("Topic relevance", relevance_value)
+        coverage = Metric.available("Concept coverage", coverage_value)
+        score = answer_score(relevance, coverage)
+        assert score.value is not None
+        return AnswerResult(
+            status=Status.AVAILABLE,
+            relevance=relevance,
+            coverage=coverage,
+            reference_similarity=reference,
+            answer_score=score,
+            concept_scores=concept_scores,
+            feedback=feedback_for(score.value),
         )
 
-    else:
 
-        coverage_score = 0
+def evaluate_answer(question: Question, transcript: Optional[str]) -> AnswerResult:
+    """Evaluate with the application's shared sentence model."""
+    from backend.core.models import get_registry
 
-    return {
-        "coverage_score": coverage_score,
-        "concept_scores": concept_scores
-    }
-
-# --------------------------------------------------
-# Complete answer evaluation
-# --------------------------------------------------
-
-def evaluate_answer(
-    question,
-    answer,
-    expected_concepts
-):
-    """
-    Evaluate a candidate's interview answer.
-
-    Metrics:
-
-    1. Semantic relevance
-    2. Concept coverage
-    3. Final answer score
-    """
-
-    if not answer or not answer.strip():
-
-        return {
-            "semantic_score": 0,
-            "concept_coverage": 0,
-            "concept_scores": {},
-            "answer_score": 0,
-            "feedback": "No answer was detected."
-        }
-
-    # ----------------------------------------------
-    # Question-answer relevance
-    # ----------------------------------------------
-
-    semantic_score = similarity_to_score(
-        semantic_similarity(
-            question,
-            answer
-        )
-    )
-
-    # ----------------------------------------------
-    # Concept coverage
-    # ----------------------------------------------
-
-    coverage = concept_coverage(
-        answer,
-        expected_concepts
-    )
-
-    coverage_score = coverage[
-        "coverage_score"
-    ]
-
-    # ----------------------------------------------
-    # Final score
-    # ----------------------------------------------
-
-    answer_score = round(
-        semantic_score * 0.40
-        +
-        coverage_score * 0.60
-    )
-
-    # Safety
-    answer_score = max(
-        0,
-        min(100, answer_score)
-    )
-
-    # ----------------------------------------------
-    # Feedback
-    # ----------------------------------------------
-
-    if answer_score >= 85:
-
-        feedback = (
-            "Excellent answer. You addressed "
-            "the question clearly and covered "
-            "the key concepts."
-        )
-
-    elif answer_score >= 70:
-
-        feedback = (
-            "Good answer. You addressed the "
-            "main idea, but some important "
-            "concepts could be explained "
-            "in more detail."
-        )
-
-    elif answer_score >= 50:
-
-        feedback = (
-            "Partially relevant answer. "
-            "Try to explain the key concepts "
-            "more directly."
-        )
-
-    else:
-
-        feedback = (
-            "The answer needs improvement. "
-            "Focus on the concepts specifically "
-            "asked in the question."
-        )
-
-    return {
-
-        "semantic_score": semantic_score,
-
-        "concept_coverage": coverage_score,
-
-        "concept_scores": coverage[
-            "concept_scores"
-        ],
-
-        "answer_score": answer_score,
-
-        "feedback": feedback
-    }
-
-
-# --------------------------------------------------
-# Test
-# --------------------------------------------------
-
-# --------------------------------------------------
-# Test
-# --------------------------------------------------
-
-if __name__ == "__main__":
-
-    from backend.ai.question_bank import get_question
-
-    question_data = get_question(
-        "Machine Learning Engineer",
-        2
-    )
-
-    question = question_data["question"]
-    expected_concepts = question_data["concepts"]
-
-    answers = [
-
-        (
-            "Overfitting happens when a model performs "
-            "very well on the training data but does not "
-            "generalize to unseen data. We can reduce it "
-            "using regularization, cross validation, or "
-            "more training data."
-        ),
-
-        (
-            "Overfitting means the model learns "
-            "the training data very closely."
-        ),
-
-        (
-            "Python is a programming language "
-            "used for developing software applications."
-        )
-    ]
-
-    print("\n")
-    print("=" * 60)
-    print("SEMANTIC + CONCEPT ANSWER EVALUATION")
-    print("=" * 60)
-
-    for i, answer in enumerate(
-        answers,
-        start=1
-    ):
-
-        result = evaluate_answer(
-            question,
-            answer,
-            expected_concepts
-        )
-
-        print("\n")
-        print(f"ANSWER {i}")
-        print("-" * 60)
-
-        print(answer)
-
-        print("\nSemantic Relevance:")
-
-        print(
-            f"{result['semantic_score']}/100"
-        )
-
-        print("\nConcept Coverage:")
-
-        print(
-            f"{result['concept_coverage']}/100"
-        )
-
-        print("\nIndividual Concepts:")
-
-        for concept, score in result[
-            "concept_scores"
-        ].items():
-
-            print(
-                f"  {score:>3}/100  {concept}"
-            )
-
-        print("\nFinal Answer Score:")
-
-        print(
-            f"{result['answer_score']}/100"
-        )
-
-        print("\nFeedback:")
-
-        print(
-            result["feedback"]
-        )
+    return AnswerEvaluator(lambda: get_registry().get("sentence")).evaluate(question, transcript)

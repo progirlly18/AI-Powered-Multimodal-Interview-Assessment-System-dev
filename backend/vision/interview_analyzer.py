@@ -1,154 +1,67 @@
-import cv2
+"""
+Compatibility wrapper around ``VisionSession``.
+
+The earlier implementations of this module (on ``main`` and in the
+2026-09-27 working copy) opened the camera and ran inference inside the
+capture loop. That logic now lives in:
+
+* ``backend.vision.capture``   - capture thread + background analysis
+* ``backend.vision.guidance``  - smoothed live guidance messages
+* ``backend.services.interview_service`` - countdown, states, cleanup
+
+``analyze_interview`` remains for scripts that want vision-only analysis.
+"""
+
+from __future__ import annotations
+
+import threading
 import time
-from collections import Counter
+from typing import Callable, Optional
 
-from backend.vision.emotion_detector import detect_emotion
-from backend.vision.eye_contact import detect_eye_contact
-from backend.vision.head_pose import detect_head_pose
+from backend.config import load_settings
+from backend.core.models import get_registry
+from backend.core.results import VisionResult
+from backend.vision.capture import OpenCVCamera, VisionSession
+from backend.vision.face_analysis import FaceAnalyzer, FrameAnalysis
+from backend.vision.guidance import guidance
+
+FrameCallback = Callable[[object, Optional[FrameAnalysis], str], None]
 
 
-def analyze_interview(duration=20, start_event=None):
+def analyze_interview(
+    duration: float = 20,
+    start_event: Optional[threading.Event] = None,
+    frame_callback: Optional[FrameCallback] = None,
+) -> VisionResult:
+    """Record ``duration`` seconds of video analysis and return the summary.
 
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        raise RuntimeError("Could not open webcam.")
-    if start_event is not None:
-        start_event.wait()
-
-    emotions = []
-    eyes = []
-    heads = []
-
-    frame_count = 0
-    start_time = time.time()
-
-    # Latest predictions shown on screen
-    emotion = "No Face"
-    eye = "No Face"
-    head = "No Face"
-    bbox = None
-
-    while True:
-
-        ret, frame = cap.read()
-
-        if not ret:
-            break
-
-        frame_count += 1
-
-        # ---------------------------------
-        # Analyze every 10th frame only
-        # ---------------------------------
-        if frame_count % 10 == 0:
-
-            emotion, confidence, bbox = detect_emotion(frame)
-            eye = detect_eye_contact(frame)
-            head = detect_head_pose(frame)
-
-            emotions.append(emotion)
-            eyes.append(eye)
-            heads.append(head)
-
-        # ---------------------------------
-        # Draw bounding box
-        # ---------------------------------
-        if bbox:
-
-            x1, y1, x2, y2 = bbox
-
-            cv2.rectangle(
-                frame,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),
-                2
-            )
-
-        # ---------------------------------
-        # Display latest predictions
-        # ---------------------------------
-        cv2.putText(
-            frame,
-            f"Emotion: {emotion}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Eye: {eye}",
-            (20, 70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Head: {head}",
-            (20, 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 200, 255),
-            2
-        )
-
-        remaining = max(0, int(duration - (time.time() - start_time)))
-
-        cv2.putText(
-            frame,
-            f"Time Left: {remaining}s",
-            (20, 140),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.imshow("Interview Analysis", frame)
-
-        # ---------------------------------
-        # Stop after duration seconds
-        # ---------------------------------
-        if time.time() - start_time >= duration:
-            break
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-    # ---------------------------------
-    # Handle edge case
-    # ---------------------------------
-    if len(emotions) == 0:
-        return {
-            "emotion": "No Face",
-            "eye": "No Face",
-            "head": "No Face"
-        }
-
-    return {
-
-        "emotion": Counter(emotions).most_common(1)[0][0],
-
-        "eye": Counter(eyes).most_common(1)[0][0],
-
-        "head": Counter(heads).most_common(1)[0][0]
-
-    }
+    ``frame_callback(frame_bgr, latest_analysis, guidance_text)`` is called
+    from this thread about 10 times per second; it must not modify the frame.
+    """
+    settings = load_settings()
+    registry = get_registry()
+    analyzer = FaceAnalyzer(lambda: registry.get("face_mesh"), lambda: registry.get("emotion"))
+    session = VisionSession(OpenCVCamera(settings.camera_index), analyzer,
+                            settings.vision_interval_s)
+    session.start()
+    try:
+        if start_event is not None:
+            start_event.wait()
+        session.begin_recording()
+        end = time.monotonic() + duration
+        while time.monotonic() < end:
+            if session.error:
+                break
+            if frame_callback is not None:
+                frame, latest = session.snapshot()
+                _level, text = guidance(session.recent_analyses(6))
+                frame_callback(frame, latest, text)
+            time.sleep(0.1)
+        session.end_recording()
+    finally:
+        session.stop()
+    return session.result()
 
 
 if __name__ == "__main__":
-
-    result = analyze_interview(duration=20)
-
-    print("\nFinal Vision Report")
-    print(result)
+    print(analyze_interview(duration=10))

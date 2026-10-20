@@ -1,0 +1,18 @@
+# Streamlit settings for local use.
+# Do not disable enableXsrfProtection / enableCORS to make the app "work":
+# they protect the local server from requests made by other websites.
+
+[server]
+# Only accept connections from this computer.
+address = "localhost"
+enableXsrfProtection = true
+enableCORS = true
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Hide Streamlit's developer error details from normal users;
+# full tracebacks are written to logs/app.log instead.
+showErrorDetails = "none"

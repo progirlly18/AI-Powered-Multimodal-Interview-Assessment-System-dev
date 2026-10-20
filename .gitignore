@@ -231,3 +231,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- AI Interview Practice: local data that must never be committed ---
+# Local diagnostic logs and optional saved recordings
+logs/
+recordings/
+# Temporary audio/video produced outside the tracked samples
+*.tmp.wav
+*.tmp.mp4
+# Benchmark and test outputs
+benchmarks/results/
+.pytest_cache/
+# Local environment (real values); .env.example holds placeholders only
+.env.local
+# Local editor/agent tooling (machine-specific paths)
+.claude/

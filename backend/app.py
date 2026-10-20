@@ -1,131 +1,106 @@
-from backend.vision.interview_analyzer import analyze_interview
-from backend.audio.speech_analyzer import analyze_speech
-from backend.scoring.scoring_engine import InterviewScorer
+"""
+Command-line interview practice (no browser).
+
+    python -m backend.app --role "Machine Learning Engineer" --question 1 --seconds 20
+
+``--question`` is 1-based, as shown by ``python -m backend.ai.question_bank``.
+Uses the same service, states and scoring as the Streamlit app.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import threading
+import time
+
+from backend.ai.question_bank import get_question, roles
+from backend.config import load_settings
+from backend.core.results import Metric, round_half_up
+from backend.core.states import RunState
+from backend.logging_setup import configure_logging
+from backend.services.interview_service import InterviewService, LiveStatus
 
 
-print("=" * 60)
-print("        AI INTERVIEW ASSESSMENT SYSTEM")
-print("=" * 60)
+def _fmt(metric: Metric, suffix: str = "") -> str:
+    if metric.is_available and metric.value is not None:
+        return f"{round_half_up(metric.value)}{suffix}"
+    return f"not available ({metric.reason})"
 
-input("\nPress ENTER to start the interview...")
 
-print("\nInterview Started!")
-print("Answer naturally for the next 20 seconds.\n")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser.add_argument("--role", default="Machine Learning Engineer", choices=roles())
+    parser.add_argument("--question", type=int, default=1, help="1-based question number")
+    parser.add_argument("--seconds", type=int, default=20)
+    parser.add_argument("--no-camera", action="store_true", help="audio-only mode")
+    args = parser.parse_args(argv)
 
-# -----------------------------------
-# Vision Analysis
-# -----------------------------------
+    question = get_question(args.role, args.question - 1)
+    if question is None:
+        print(f"No question {args.question} for role {args.role!r}.", file=sys.stderr)
+        return 2
 
-print("Starting Vision Analysis...\n")
+    settings = load_settings()
+    configure_logging(settings.log_dir)
+    service = InterviewService(settings=settings)
 
-vision = analyze_interview(duration=20)
+    print("Loading models (the first run can take several minutes)…")
+    for name, info in service.load_models(service.required_models(not args.no_camera)).items():
+        print(f"  {info.label}: {info.status.value}")
+        if info.status.value != "ready":
+            print("A required model is not available; see logs/app.log.", file=sys.stderr)
+            return 1
 
-# -----------------------------------
-# Audio Analysis
-# -----------------------------------
+    print(f"\nQuestion: {question.text}")
+    input("Press ENTER to start (Ctrl+C cancels)…")
 
-print("\nStarting Speech Analysis...\n")
+    status = LiveStatus()
+    cancel = threading.Event()
+    holder: dict = {}
+    worker = threading.Thread(
+        target=lambda: holder.setdefault(
+            "outcome",
+            service.run_question(question, args.seconds, use_camera=not args.no_camera,
+                                 status=status, cancel=cancel),
+        )
+    )
+    worker.start()
+    last = None
+    try:
+        while worker.is_alive():
+            snap = status.snapshot()
+            line = f"[{snap.state.value}] {snap.message}"
+            if snap.seconds_left is not None:
+                line += f" {int(snap.seconds_left) + 1}s"
+            if line != last:
+                print(line)
+                last = line
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        cancel.set()
+    worker.join()
+    outcome = holder["outcome"]
+    print(f"\nResult: {outcome.state.value} — {outcome.message}")
+    if outcome.state is not RunState.COMPLETED or outcome.result is None:
+        return 1
 
-audio = analyze_speech(seconds=20)
+    r = outcome.result
+    print(f"\nTranscript: {r.speech.transcript or '(none)'}")
+    print(f"Speaking pace: {_fmt(r.speech.wpm, ' wpm')}; fillers: {r.speech.filler_count}")
+    print(f"Looking at camera: {_fmt(r.vision.eye_contact, '%')}; "
+          f"facing camera: {_fmt(r.vision.head_facing, '%')}")
+    print(f"Answer content: {_fmt(r.answer.answer_score)} "
+          f"(relevance {_fmt(r.answer.relevance)}, coverage {_fmt(r.answer.coverage)})")
+    label = "Practice score (partial)" if r.score.is_partial else "Practice score"
+    print(f"{label}: {_fmt(r.score.overall)}")
+    for line in r.score.explanation:
+        print(f"  {line}")
+    print("\nSuggestions:")
+    for tip in r.suggestions:
+        print(f"  - {tip}")
+    return 0
 
-# -----------------------------------
-# Scoring
-# -----------------------------------
 
-scorer = InterviewScorer()
-
-scorer.emotion_score(
-    vision["emotion"]
-)
-
-scorer.eye_score(
-    vision["eye"]
-)
-
-scorer.head_score(
-    vision["head"]
-)
-
-# Convert 0-100 to 0-20
-
-speech_points = round(
-    audio["speech_score"] / 5
-)
-
-scorer.speech_score(
-    speech_points
-)
-
-scorer.background_score(
-    audio["background_natural"]
-)
-
-overall = scorer.total()
-
-# -----------------------------------
-# REPORT
-# -----------------------------------
-
-print("\n")
-print("=" * 60)
-print("             INTERVIEW REPORT")
-print("=" * 60)
-
-print("\nVISION")
-
-print(f"Emotion          : {vision['emotion']}")
-print(f"Eye Contact      : {vision['eye']}")
-print(f"Head Pose        : {vision['head']}")
-
-print("\nAUDIO")
-
-print(f"Transcript       : {audio['transcript']}")
-print(f"Fillers          : {audio['total_fillers']}")
-print(f"Words            : {audio['word_count']}")
-print(f"WPM              : {audio['wpm']}")
-print(f"Background       : {audio['background']}")
-print(f"Speech Score     : {audio['speech_score']}/100")
-
-print("\nOVERALL")
-
-print(f"Interview Score  : {overall}/100")
-
-print("\nFEEDBACK")
-
-if overall >= 90:
-
-    print("Excellent interview performance!")
-
-elif overall >= 75:
-
-    print("Good interview performance.")
-
-else:
-
-    print("Needs improvement.")
-
-if audio["total_fillers"] > 3:
-
-    print("- Reduce filler words.")
-
-if audio["wpm"] > 170:
-
-    print("- Slow down while speaking.")
-
-elif audio["wpm"] < 90:
-
-    print("- Speak a little faster.")
-
-if vision["eye"] != "Looking Center":
-
-    print("- Maintain better eye contact.")
-
-if vision["head"] != "Center":
-
-    print("- Keep your head facing the interviewer.")
-
-if not audio["background_natural"]:
-
-    print("- Background noise may require review.")
-
-print("\n" + "=" * 60)
+if __name__ == "__main__":
+    raise SystemExit(main())
