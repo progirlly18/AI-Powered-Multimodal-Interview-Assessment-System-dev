@@ -58,12 +58,58 @@ def test_good_answer_scores_higher_than_off_topic(overfitting_question):
     assert off.concept_scores == {"Generalization": 0, "Regularization": 0, "Cross validation": 0}
 
 
-def test_answer_score_is_weighted_combination(overfitting_question):
+def test_answer_score_is_weighted_rubric(overfitting_question):
     ev = AnswerEvaluator(lambda: FakeEncoder())
     r = ev.evaluate(overfitting_question, "Regularization reduces variance.")
-    expected = 0.4 * r.relevance.value + 0.6 * r.coverage.value
+    assert [c.key for c in r.criteria] == ["relevance", "coverage", "elaboration",
+                                           "structure", "examples"]
+    assert sum(c.weight for c in r.criteria) == pytest.approx(1.0)
+    expected = sum(c.weight * c.metric.value for c in r.criteria)
     assert r.answer_score.value == pytest.approx(expected)
     assert 0 <= r.answer_score.value <= 100
+    assert all(c.explanation for c in r.criteria)
+    # Relevance and coverage in the rubric are the same numbers shown separately.
+    assert r.criteria[0].metric.value == r.relevance.value
+    assert r.criteria[1].metric.value == r.coverage.value
+
+
+def test_strengths_and_improvements_follow_scores(overfitting_question):
+    ev = AnswerEvaluator(lambda: FakeEncoder())
+    rich = ev.evaluate(overfitting_question,
+                       "First, overfitting means the model fails to generalize because it "
+                       "memorises noise. For example, in my project a model scored 99% on "
+                       "training data but 70% on test data. However, regularization and cross "
+                       "validation fixed it. Overall, simpler models generalize better, and "
+                       "we used early stopping as well to keep the gap small on new data.")
+    thin = ev.evaluate(overfitting_question, "It is bad.")
+    assert "Backed the answer with concrete detail." in rich.strengths
+    assert "Signposted the reasoning clearly." in rich.strengths
+    assert any("concrete example" in tip for tip in thin.improvements)
+    assert any("Develop the answer" in tip for tip in thin.improvements)
+    assert rich.answer_score.value > thin.answer_score.value
+
+
+def test_behavioural_questions_weight_examples_more(overfitting_question):
+    from dataclasses import replace
+
+    from backend.ai.rubric import default_rubric
+
+    tech = default_rubric().weights_for("technical")["examples"]
+    beh = default_rubric().weights_for("behavioural")["examples"]
+    assert beh > tech
+    q = replace(overfitting_question, category="behavioural")
+    r = AnswerEvaluator(lambda: FakeEncoder()).evaluate(q, "For example, I built a tool.")
+    assert next(c for c in r.criteria if c.key == "examples").weight == beh
+
+
+def test_invalid_rubric_fails_cleanly(overfitting_question):
+    from backend.ai.rubric import RubricError
+
+    def broken():
+        raise RubricError("weights must sum to 1")
+    r = AnswerEvaluator(lambda: FakeEncoder(), broken).evaluate(overfitting_question, "Answer.")
+    assert r.status is Status.FAILED and "rubric" in r.reason.lower()
+    assert r.answer_score.value is None
 
 
 @pytest.mark.parametrize("transcript", [None, "", "   ", "...", "?!"])
@@ -105,8 +151,9 @@ def test_reference_answer_reported_separately(overfitting_question):
     assert r.reference_similarity.is_available
     no_ref = AnswerEvaluator(lambda: FakeEncoder()).evaluate(overfitting_question, "Overfitting.")
     assert not no_ref.reference_similarity.is_available
-    # The reference similarity does not change the answer score formula.
-    assert r.answer_score.value == pytest.approx(0.4 * r.relevance.value + 0.6 * r.coverage.value)
+    # The reference similarity is not part of the rubric.
+    assert r.answer_score.value == pytest.approx(sum(c.weight * c.metric.value for c in r.criteria))
+    assert "reference" not in [c.key for c in r.criteria]
 
 
 def test_semantic_only_matches_are_capped(overfitting_question):

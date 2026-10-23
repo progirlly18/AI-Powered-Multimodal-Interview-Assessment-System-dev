@@ -77,23 +77,33 @@ class OpenCVCamera:
 CameraFactory = Callable[[], CameraSource]
 
 
-def check_camera(camera: CameraSource) -> tuple[bool, str]:
-    """Open the camera, confirm one frame arrives, release it. Nothing is kept."""
+def probe_camera(camera: CameraSource) -> tuple[bool, str, Optional[np.ndarray]]:
+    """Open the camera, grab one frame, release it.
+
+    Returns (ok, message, frame). The frame is only for an on-screen preview;
+    callers must not store it beyond the page that shows it.
+    """
     try:
         camera.open()
     except DeviceUnavailableError as exc:
-        return False, str(exc)
+        return False, str(exc), None
     try:
         deadline = time.monotonic() + FIRST_FRAME_TIMEOUT_S
         while time.monotonic() < deadline:
             ok, frame = camera.read()
-            if ok and frame is not None:
+            if ok and frame is not None and frame.ndim == 3 and frame.shape[2] == 3:
                 h, w = frame.shape[:2]
-                return True, f"Camera ready ({w}x{h})."
+                return True, f"Camera ready ({w}x{h}).", frame
             time.sleep(0.05)
-        return False, "The camera opened but did not deliver any video frames."
+        return False, "The camera opened but did not deliver any video frames.", None
     finally:
         camera.release()
+
+
+def check_camera(camera: CameraSource) -> tuple[bool, str]:
+    """Open the camera, confirm one frame arrives, release it. Nothing is kept."""
+    ok, message, _frame = probe_camera(camera)
+    return ok, message
 
 
 class VisionSession:
@@ -303,6 +313,7 @@ def aggregate_vision(analyses: list[FrameAnalysis], frames_captured: int,
         frames_captured=frames_captured,
         frames_analysed=analysed,
         frames_with_face=len(with_face),
+        frames_multiple_faces=sum(1 for a in with_face if a.face_count > 1),
         face_presence=Metric.available("Face in view", presence, "%"),
         eye_counts=dict(eye_counts),
         head_counts=dict(head_counts),

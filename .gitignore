@@ -246,3 +246,6 @@ benchmarks/results/
 .env.local
 # Local editor/agent tooling (machine-specific paths)
 .claude/
+
+# Local interview history database (scores and feedback only)
+instance/

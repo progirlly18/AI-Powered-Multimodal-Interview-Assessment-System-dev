@@ -1,8 +1,10 @@
 # Architecture
 
 ```
-frontend/app.py            Streamlit pages (one per session Stage); polls LiveStatus
-frontend/ui_components.py  Rendering helpers (native Streamlit components only)
+frontend/app.py            Streamlit pages (one per session Stage) + live console; polls LiveStatus
+frontend/theme.py          HUMAN NEXT palette constants + global CSS (no external fonts/assets)
+frontend/components.py     Small HTML pieces (cards, chips, bars, ring, stepper); escapes all text
+frontend/ui_components.py  Answer review (from QuestionResult) and session dashboard (from SessionRecord)
 
 backend/core/
   results.py   Metric (available / unavailable / failed) and result dataclasses
@@ -15,27 +17,54 @@ backend/services/interview_service.py
                recording -> processing -> QuestionResult
 backend/vision/
   capture.py        VisionSession: capture thread + analysis thread, cleanup
-  face_analysis.py  One landmark pass -> gaze, head pose, expression
-  landmarks.py      MediaPipe FaceLandmarker (absolute model path)
-  eye_contact.py, head_pose.py, emotion_detector.py   pure rules / model call
-  guidance.py       Smoothed live guidance
+  face_analysis.py  One landmark pass -> gaze, head pose; expression at most every
+                    emotion_interval_s; counts faces (up to 2)
+  landmarks.py      MediaPipe FaceLandmarker (absolute model path), detect_all()
+  eye_contact.py, head_pose.py   pure rules
+  emotion_detector.py  preprocessing, model call, probability validation
+  emotion_smoothing.py time-window average of expression probabilities (display only)
+  guidance.py       Smoothed live guidance (incl. multiple-face warning)
 backend/audio/
   recorder.py        MicrophoneRecorder (sounddevice InputStream)
   speech_analyzer.py Whisper (in memory) + delivery metrics + YAMNet label
   speech_metrics.py  Pure rules: fillers, pace, levels
 backend/ai/
   question_bank.py   data/questions.json loader + validation
-  answer_evaluator.py  Topic relevance + concept coverage
+  rubric.py          data/rubric.json loader + validation (weights per category)
+  text_features.py   elaboration / structure / examples heuristics with explanations
+  answer_evaluator.py  rubric criteria, strengths and improvements
 backend/scoring/scoring_engine.py  Overall practice score (docs/SCORING.md)
+backend/storage/
+  records.py   SessionRecord: one serialisable summary used by dashboard, history, export
+  history.py   HistoryStore: SQLite (instance/history.db), filtered by owner, friendly HistoryError
+backend/auth/  (docs/AUTH.md)
+  email_rules.py  format / reserved / disposable / allow-list checks
+  codes.py        6-digit codes, salted hashes, constant-time compare
+  store.py        users + pending code hashes (instance/auth.db)
+  mailer.py       SmtpMailer (smtplib, STARTTLS/SSL)
+  service.py      AuthService: request_code, verify_code, limits, session age
+  config.py       AuthSettings from env vars or .streamlit/secrets.toml [auth]
+frontend/auth_view.py  sign-in page (gate runs before any other page)
+  report.py    CSV and self-contained HTML report (print to PDF)
 ```
+
+## Design decisions
+
+- **One status object, no UI callbacks from threads.** The WIP and the teammate branch had incompatible callback signatures. Both were replaced by a thread-safe `LiveStatus` that the Streamlit script polls, sending the browser only what changed.
+- **Latest-frame analysis.** The capture thread never runs a model. The analysis thread takes the newest frame, so a slow model can't build up a backlog. The expression model (~310 ms measured) is sampled about once per second.
+- **Raw vs. smoothed expression.** Raw per-prediction probabilities are kept in `FrameAnalysis`. The display averages them over 3 s and shows how many predictions that is. Neither value is scored.
+- **One record for everything after the interview.** `SessionRecord` feeds the dashboard, history and exports, so they cannot disagree.
+- **Escaping at the edge.** Every HTML fragment is built in `frontend/components.py` (or with `html.escape`); user text and transcripts otherwise go through native Streamlit, which escapes.
+- **No new dependencies.** SQLite and CSV come from the standard library. The PDF comes from the browser's print dialog applied to the HTML report.
 
 ## Interview workflow
 
 ```
 WELCOME -> SETUP -> READINESS -> CONSENT -> QUESTION <-> REVIEW -> SUMMARY
+WELCOME / SUMMARY -> HISTORY
 ```
 
-1. **Setup:** choose role, questions (in order), answer time, and camera on or off.
+1. **Setup:** choose role, difficulty filter, questions (in order), answer time, camera on or off, and an optional name or label.
 2. **Readiness:**
    - "Load models" loads each model and shows its real load time.
    - "Check devices" opens the microphone and camera briefly; nothing is kept.
@@ -44,7 +73,8 @@ WELCOME -> SETUP -> READINESS -> CONSENT -> QUESTION <-> REVIEW -> SUMMARY
 3. **Consent:** explains when recording happens and what is kept; requires a checkbox.
 4. **Question:** only the question text is shown, never the concepts or reference answers. *Start recording* starts a worker thread.
 5. **Review:** full score breakdown, or a clear failure message with Retry. Each question's outcome is recorded exactly once; Retry discards it.
-6. **Summary:** per-question status and the average over scored questions.
+6. **Summary:** the dashboard, plus CSV/HTML export and save to history (transcripts only if ticked).
+7. **History:** saved sessions open in the same dashboard; delete one or clear all.
 
 ## One recording (`RunState`)
 

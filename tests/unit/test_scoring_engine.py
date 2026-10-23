@@ -6,6 +6,7 @@ import pytest
 
 from backend.core.results import (
     AnswerResult,
+    CriterionScore,
     Metric,
     SpeechResult,
     Status,
@@ -15,11 +16,11 @@ from backend.core.results import (
 from backend.scoring.scoring_engine import (
     COMPONENTS,
     ScoringInputError,
-    answer_score,
     build_suggestions,
     clamp_0_100,
     compute_overall,
     delivery_score,
+    rubric_answer_score,
     score_question,
     session_summary,
 )
@@ -98,25 +99,39 @@ def test_speech_contribution_no_longer_saturates():
     assert high > low
 
 
-# ---------------- answer content ----------------
+# ---------------- answer content (rubric) ----------------
 
-def test_answer_score_formula():
-    assert answer_score(A(50), A(75)).value == pytest.approx(65.0)  # 0.4*50 + 0.6*75
+TECH_WEIGHTS = {"relevance": 0.25, "coverage": 0.45, "elaboration": 0.10,
+                "structure": 0.10, "examples": 0.10}
 
 
-def test_answer_score_unavailable_propagates_reason():
-    m = answer_score(U("no transcript"), A(50))
+def crit(values, weights=TECH_WEIGHTS):
+    return [CriterionScore(k, k, v if isinstance(v, Metric) else A(v), weights[k], "")
+            for k, v in zip(weights, values)]
+
+
+def test_rubric_formula_example():
+    """docs/SCORING.md example 5: 0.25*60 + 0.45*80 + 0.1*100 + 0.1*50 + 0.1*0 = 66."""
+    assert rubric_answer_score(crit([60, 80, 100, 50, 0])).value == pytest.approx(66.0)
+
+
+def test_rubric_unavailable_propagates_reason():
+    m = rubric_answer_score(crit([U("no transcript"), 50, 50, 50, 50]))
     assert m.status is Status.UNAVAILABLE and "no transcript" in m.reason
 
 
-def test_answer_score_failed_status_propagates():
-    m = answer_score(Metric.failed("Topic relevance", "model error"), A(50))
+def test_rubric_failed_status_propagates():
+    m = rubric_answer_score(crit([Metric.failed("Topic relevance", "model error"), 50, 50, 50, 50]))
     assert m.status is Status.FAILED
 
 
-def test_answer_score_rejects_out_of_range():
+def test_rubric_rejects_out_of_range_and_bad_weights():
     with pytest.raises(ScoringInputError):
-        answer_score(A(120), A(50))
+        rubric_answer_score(crit([120, 50, 50, 50, 50]))
+    bad = dict(TECH_WEIGHTS, examples=0.5)
+    with pytest.raises(ScoringInputError, match="sum to 1"):
+        rubric_answer_score(crit([50] * 5, bad))
+    assert not rubric_answer_score([]).is_available
 
 
 # ---------------- overall ----------------
@@ -246,6 +261,14 @@ def test_suggestions_only_use_measured_metrics():
     assert "camera" not in text.lower()
     assert "slowly" in text and "um" in text
     assert "Points you could cover next time: B." in tips
+
+
+def test_missing_concepts_not_repeated():
+    a = _answer(30)
+    a.improvements = ["Cover the expected points — e.g. B."]
+    tips = build_suggestions(_vision(100, 100), _speech(), a)
+    assert tips.count("Cover the expected points — e.g. B.") == 1
+    assert not any(t.startswith("Points you could cover") for t in tips)
 
 
 def test_suggestions_default_message():

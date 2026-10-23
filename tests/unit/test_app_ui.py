@@ -3,6 +3,7 @@
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
@@ -12,6 +13,7 @@ from backend.ai.answer_evaluator import AnswerEvaluator
 from backend.audio.speech_analyzer import SpeechAnalyzer
 from backend.core.models import ModelRegistry, ModelSpec
 from backend.services import interview_service as svc
+from backend.storage.history import LOCAL_OWNER, HistoryStore
 from tests.conftest import (
     YAMNET_LABELS,
     FakeCamera,
@@ -23,18 +25,24 @@ from tests.conftest import (
 )
 
 APP = str(Path(__file__).resolve().parents[2] / "frontend" / "app.py")
-TRANSCRIPT = "<script>alert('x')</script> Supervised learning uses labeled data to predict outputs."
+TRANSCRIPT = ("<script>alert('x')</script> First, supervised learning uses labeled data "
+              "because the model learns to predict outputs, for example 95% accuracy.")
+EVIL_NAME = "<img src=x onerror=alert(1)>"
 
 
 @pytest.fixture
-def fake_app(monkeypatch, fast_settings):
-    """Patch the service, device checks and models used by the app."""
+def fake_app(monkeypatch, fast_settings, tmp_path):
+    """Patch the service, device checks, models, logging and history location."""
     monkeypatch.setattr(svc, "MIN_DURATION_S", 0.5)
     monkeypatch.setenv("INTERVIEW_AI_COUNTDOWN", "0")
+    # These tests cover the interview flow; sign-in is tested in test_auth_ui.py.
+    monkeypatch.setenv("INTERVIEW_AI_REQUIRE_SIGN_IN", "false")
+    history_path = tmp_path / "history.db"
+    monkeypatch.setenv("INTERVIEW_AI_HISTORY_PATH", str(history_path))
     settings = replace(fast_settings, countdown_s=0)
     names = ["face_mesh", "emotion", "whisper", "sentence", "yamnet"]
     registry = ModelRegistry({n: ModelSpec(n.title(), object, "") for n in names})
-    state = {"camera_ok": True}
+    state = {"camera_ok": True, "history": history_path}
     real_service = svc.InterviewService
 
     def factory(settings_arg=None, **_kw):
@@ -55,9 +63,13 @@ def fake_app(monkeypatch, fast_settings):
     monkeypatch.setattr("backend.logging_setup.configure_logging", lambda *a, **k: None)
     monkeypatch.setattr("backend.audio.recorder.check_microphone",
                         lambda *a, **k: (True, "Microphone ready (fake)."))
-    monkeypatch.setattr("backend.vision.capture.check_camera",
-                        lambda cam: (state["camera_ok"], "Camera ready (fake)." if state["camera_ok"]
-                                     else "The camera could not be opened."))
+
+    def probe(cam):
+        if state["camera_ok"]:
+            return True, "Camera ready (fake).", np.zeros((48, 64, 3), np.uint8)
+        return False, "The camera could not be opened.", None
+
+    monkeypatch.setattr("backend.vision.capture.probe_camera", probe)
     st.cache_resource.clear()
     yield state
     st.cache_resource.clear()
@@ -70,6 +82,10 @@ def click(at: AppTest, label: str) -> AppTest:
     return at.run()
 
 
+def button(at: AppTest, label: str):
+    return [b for b in at.button if b.label == label][0]
+
+
 def texts(at: AppTest) -> str:
     parts = [m.value for m in at.markdown] + [s.value for s in at.subheader] + \
             [t.value for t in at.title] + [c.value for c in at.caption]
@@ -78,10 +94,16 @@ def texts(at: AppTest) -> str:
     return "\n".join(str(p) for p in parts)
 
 
-def to_question_page(at: AppTest, use_camera=True) -> AppTest:
+def html_blocks(at: AppTest) -> list[str]:
+    return [m.value for m in at.markdown if getattr(m.proto, "allow_html", False)]
+
+
+def to_question_page(at: AppTest, use_camera=True, name="") -> AppTest:
     at.run()
-    click(at, "Get started")
+    click(at, "Start Interview")
     at.slider[0].set_value(10)
+    if name:
+        at.text_input[0].set_value(name)
     if not use_camera:
         at.toggle[0].set_value(False)
     click(at, "Continue")
@@ -92,66 +114,100 @@ def to_question_page(at: AppTest, use_camera=True) -> AppTest:
     return click(at, "Start interview")
 
 
-def test_welcome_page_states_limitations(fake_app):
+def test_landing_page_brand_cta_and_limits(fake_app):
     at = AppTest.from_file(APP, default_timeout=30).run()
     assert not at.exception
-    assert "not be used to make hiring decisions" in texts(at)
+    page = texts(at)
+    assert "HUMAN NEXT" in page and "Interview Potential" in page
+    for feature in ("Live Behavioral Insights", "AI Response Evaluation", "Personalized Feedback"):
+        assert feature in page
+    assert "not a hiring decision system" in page
+    assert button(at, "Start Interview").proto.type == "primary"
 
 
-def test_full_flow(fake_app):
-    at = to_question_page(AppTest.from_file(APP, default_timeout=60))
+def test_full_flow_with_history_and_export(fake_app):
+    at = to_question_page(AppTest.from_file(APP, default_timeout=60), name=EVIL_NAME)
     assert not at.exception
     page = texts(at)
     question = qb.get_questions("Software Engineer")[0]
     assert question.text in page
-    # The rubric is not shown before answering.
-    for concept in question.concepts:
+    for concept in question.concepts:           # the rubric is not shown before answering
         assert concept.name not in page
+    assert "Camera standby" in page and "Pause/resume is not supported" in page
 
-    at = click(at, "Start recording")  # renders the live view until the run ends
-    at.run()                             # review page
+    at = click(at, "Start recording")   # renders the live console until the run ends
+    at.run()                            # review page
     assert not at.exception
     page = texts(at)
-    assert [m.label for m in at.metric][0].startswith("Practice score")
-    assert "Recording" not in [b.label for b in at.button]
-    # Transcript text is escaped, never rendered as HTML.
-    assert all(not getattr(m.proto, "allow_html", False) for m in at.markdown)
-    assert "<script>" in page
+    assert "PRACTICE SCORE" in page and "Why the answer scored this way" in page
+    assert "Examples &amp; evidence" in page or "Examples & evidence" in page
+    # User-controlled text is never rendered as raw HTML.
+    for block in html_blocks(at):
+        assert "<script>" not in block and "<img src=x" not in block
+    assert "<script>" in page  # shown, but as plain escaped text in the transcript
 
     at = click(at, "Finish")
-    assert "Interview summary" in texts(at)
-    at = click(at, "Start a new interview")
-    assert "Interview setup" in texts(at)
+    assert "Interview results" in texts(at)
+    assert [d.label for d in at.get("download_button")] == [
+        "Download report (HTML → print to PDF)", "Download data (CSV)"]
+    at = click(at, "Save to history")
+    assert any("Saved." in s.value for s in at.success)
+    saved = HistoryStore(fake_app["history"], LOCAL_OWNER).list()
+    assert len(saved) == 1 and saved[0].candidate == EVIL_NAME
+    # Transcripts are not stored unless requested.
+    assert HistoryStore(fake_app["history"], LOCAL_OWNER).get(saved[0].session_id).answers[0].transcript is None
+
+    at = click(at, "History")
+    assert "Interview history" in texts(at)
+    for block in html_blocks(at):
+        assert "<img src=x" not in block
+    at = click(at, "New interview")
+    assert "Configure your interview" in texts(at)
 
 
 def test_continue_disabled_until_ready(fake_app):
     at = AppTest.from_file(APP, default_timeout=30).run()
-    click(at, "Get started")
+    click(at, "Start Interview")
     click(at, "Continue")
-    cont = [b for b in at.button if b.label == "Continue"][0]
-    assert cont.disabled  # models not loaded, devices not checked
+    assert button(at, "Continue").disabled  # models not loaded, devices not checked
     assert "Not checked" in texts(at)
 
 
 def test_camera_failure_offers_audio_only(fake_app):
     fake_app["camera_ok"] = False
     at = AppTest.from_file(APP, default_timeout=30).run()
-    click(at, "Get started")
+    click(at, "Start Interview")
     click(at, "Continue")
     click(at, "Load models")
     click(at, "Check devices")
     assert "The camera could not be opened." in texts(at)
-    assert [b for b in at.button if b.label == "Continue"][0].disabled
+    assert button(at, "Continue").disabled
     click(at, "Continue with audio only")
     click(at, "Check devices")
-    assert not [b for b in at.button if b.label == "Continue"][0].disabled
+    assert not button(at, "Continue").disabled
 
 
 def test_consent_required(fake_app):
     at = AppTest.from_file(APP, default_timeout=30).run()
-    click(at, "Get started")
+    click(at, "Start Interview")
     click(at, "Continue")
     click(at, "Load models")
     click(at, "Check devices")
     click(at, "Continue")
-    assert [b for b in at.button if b.label == "Start interview"][0].disabled
+    assert button(at, "Start interview").disabled
+
+
+def test_difficulty_filter_changes_questions(fake_app):
+    at = AppTest.from_file(APP, default_timeout=30).run()
+    click(at, "Start Interview")
+    at.selectbox[0].set_value("Machine Learning Engineer").run()
+    at.selectbox[1].set_value("Medium").run()
+    options = at.multiselect[0].options
+    medium = [q for q in qb.get_questions("Machine Learning Engineer") if q.difficulty == "Medium"]
+    assert len(options) == len(medium)
+
+
+def test_empty_history_page(fake_app):
+    at = AppTest.from_file(APP, default_timeout=30).run()
+    at = click(at, "View history")
+    assert "No saved sessions yet" in texts(at)

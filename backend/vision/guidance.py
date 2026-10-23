@@ -35,6 +35,8 @@ def guidance(recent: Sequence[FrameAnalysis]) -> tuple[str, str]:
     if _share([not a.face_detected for a in window]) >= MAJORITY:
         return WARNING, "Your face is not clearly visible. Move into the frame and check the lighting."
     faces = [a for a in window if a.face_detected]
+    if _share([a.face_count > 1 for a in faces]) >= MAJORITY:
+        return WARNING, "More than one face is in view; feedback uses only one of them."
     if _share([a.head != CENTER for a in faces]) >= MAJORITY:
         return WARNING, "Try turning your head towards the camera."
     if _share([a.eye != LOOKING_CENTER for a in faces]) >= MAJORITY:

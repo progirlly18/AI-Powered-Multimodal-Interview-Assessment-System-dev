@@ -118,7 +118,9 @@ def _load_emotion_model(settings: Settings) -> Any:
 def _load_face_mesh(settings: Settings) -> Any:
     from backend.vision.landmarks import FaceLandmarker
 
-    return FaceLandmarker(settings.face_landmarker_path, max_faces=1)
+    # Two faces so a second person in view can be detected and flagged;
+    # analysis always uses the first face MediaPipe returns.
+    return FaceLandmarker(settings.face_landmarker_path, max_faces=2)
 
 
 def _load_whisper(settings: Settings) -> Any:

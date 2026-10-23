@@ -20,6 +20,11 @@
 | Video frames | memory (latest frame only) | discarded continuously; never written to disk |
 | Per-frame face labels (gaze, head, expression) | memory | until the result is built |
 | Transcript and scores | browser session state | until you start a new interview or close the app |
+| Camera preview on the system-check page | memory, one frame | until you leave that page; never saved |
+| Saved history (only when you press *Save to history*) | `instance/history.db` (SQLite, git-ignored) | until you delete it on the History page; contains the session ID, date, role, optional name, scores, explanations and feedback — **transcripts only if you tick "Include transcripts"**; never audio, video or frames |
+| Downloaded reports (CSV/HTML) | wherever your browser saves them | your choice; transcripts only if ticked |
+| Sign-in account | `instance/auth.db` (git-ignored) | email address, first and last sign-in time; pending code **hashes** with expiry and counters (never the code itself) |
+| Sign-in emails | sent through the SMTP account you configure | contain only the one-time code and a short note |
 | Diagnostic log `logs/app.log` | disk (git-ignored) | rotated at 1 MB, 3 files kept; contains timings, states and errors, **never** transcripts, audio or video |
 | Audio copies (only if `INTERVIEW_AI_KEEP_RECORDINGS=true`) | `recordings/` (git-ignored) | until you delete them |
 

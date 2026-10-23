@@ -11,9 +11,12 @@ Signals (all 0-100, see docs/SCORING.md):
   as whole words, otherwise min(similarity x 100, 70) if the best
   alias-to-sentence similarity is at least 0.50, else 0. Averaged over
   concepts.
+* Elaboration, structure, examples: transparent text heuristics
+  (backend/ai/text_features.py).
 * Similarity to a reference answer: only when the question has one
   (none do yet). Reported separately and not part of the answer score.
 
+The answer score is the weighted rubric in data/rubric.json.
 These are heuristics. Semantic similarity is not evidence of technical
 correctness, completeness or sound reasoning.
 """
@@ -27,8 +30,10 @@ from typing import Callable, Optional, Protocol, Sequence
 import numpy as np
 
 from backend.ai.question_bank import Question
-from backend.core.results import AnswerResult, Metric, Status, round_half_up
-from backend.scoring.scoring_engine import answer_score, clamp_0_100
+from backend.ai.rubric import CRITERIA, Rubric, RubricError, default_rubric
+from backend.ai.text_features import elaboration, examples, structure
+from backend.core.results import AnswerResult, CriterionScore, Metric, Status, round_half_up
+from backend.scoring.scoring_engine import clamp_0_100, rubric_answer_score
 
 log = logging.getLogger(__name__)
 
@@ -88,10 +93,12 @@ def feedback_for(score: float) -> str:
 class AnswerEvaluator:
     """Evaluates answers with a sentence-embedding model."""
 
-    def __init__(self, encoder_provider: Callable[[], Encoder]) -> None:
-        # A provider (not the encoder itself) so the model loads lazily and
-        # load failures surface as an evaluation failure.
+    def __init__(self, encoder_provider: Callable[[], Encoder],
+                 rubric_provider: Callable[[], Rubric] = default_rubric) -> None:
+        # Providers (not the objects) so the model loads lazily and load
+        # failures surface as an evaluation failure.
         self._encoder_provider = encoder_provider
+        self._rubric_provider = rubric_provider
 
     def _encode(self, texts: Sequence[str]) -> np.ndarray:
         encoder = self._encoder_provider()
@@ -169,10 +176,27 @@ class AnswerEvaluator:
                 answer_score=Metric.failed("Answer content", reason),
             )
 
+        try:
+            rubric = self._rubric_provider()
+            weights = rubric.weights_for(question.category)
+        except RubricError as exc:
+            log.exception("Rubric could not be loaded")
+            reason = f"The answer rubric is invalid: {exc}"
+            return AnswerResult(
+                status=Status.FAILED, reason=reason,
+                relevance=Metric.failed("Topic relevance", reason),
+                coverage=Metric.failed("Concept coverage", reason),
+                answer_score=Metric.failed("Answer content", reason),
+            )
+
         relevance = Metric.available("Topic relevance", relevance_value)
         coverage = Metric.available("Concept coverage", coverage_value)
-        score = answer_score(relevance, coverage)
+        criteria = self._criteria(text, question, relevance_value, coverage_value,
+                                  concept_scores, weights, rubric.target_words)
+        score = rubric_answer_score(criteria)
         assert score.value is not None
+        strengths, improvements = strengths_and_improvements(criteria, concept_scores,
+                                                             rubric.target_words)
         return AnswerResult(
             status=Status.AVAILABLE,
             relevance=relevance,
@@ -181,7 +205,78 @@ class AnswerEvaluator:
             answer_score=score,
             concept_scores=concept_scores,
             feedback=feedback_for(score.value),
+            criteria=criteria,
+            strengths=strengths,
+            improvements=improvements,
         )
+
+    @staticmethod
+    def _criteria(text: str, question: Question, relevance: float, coverage: float,
+                  concept_scores: dict[str, int], weights: dict[str, float],
+                  target_words: int) -> list[CriterionScore]:
+        full = sum(1 for v in concept_scores.values() if v == 100)
+        partial = sum(1 for v in concept_scores.values() if 0 < v < 100)
+        total = len(concept_scores)
+        features = {
+            "relevance": (relevance,
+                          f"Semantic similarity to the question: {relevance:.0f}/100 "
+                          "(uncalibrated; on-topic answers typically land around 40-70)."),
+            "coverage": (coverage,
+                         f"{full} of {total} expected concepts stated explicitly"
+                         + (f", {partial} by paraphrase" if partial else "") + "."),
+        }
+        for key, fn in (("elaboration", lambda t: elaboration(t, target_words)),
+                        ("structure", structure), ("examples", examples)):
+            feature = fn(text)
+            features[key] = (feature.score, feature.explanation)
+        return [
+            CriterionScore(
+                key=key,
+                label=CRITERIA[key],
+                metric=Metric.available(CRITERIA[key], clamp_0_100(features[key][0])),
+                weight=weights[key],
+                explanation=features[key][1],
+            )
+            for key in CRITERIA
+        ]
+
+
+STRENGTH_THRESHOLD = 75.0
+IMPROVE_THRESHOLD = 50.0
+
+_STRENGTH_TEXT = {
+    "relevance": "Stayed on topic and answered the question asked.",
+    "coverage": "Covered the key concepts the question expects.",
+    "elaboration": "Developed the answer fully.",
+    "structure": "Signposted the reasoning clearly.",
+    "examples": "Backed the answer with concrete detail.",
+}
+
+
+def strengths_and_improvements(criteria: list[CriterionScore], concept_scores: dict[str, int],
+                               target_words: int) -> tuple[list[str], list[str]]:
+    """Plain-language strengths (score >= 75) and improvements (score < 50)."""
+    strengths: list[str] = []
+    improvements: list[str] = []
+    missing = [name for name, v in concept_scores.items() if v == 0]
+    tips = {
+        "relevance": "Answer the question directly in your first sentence, then expand.",
+        "coverage": ("Cover the expected points" + (f" — e.g. {', '.join(missing[:3])}" if missing else "")
+                     + "."),
+        "elaboration": f"Develop the answer further: about {target_words} words "
+                       "(roughly 30 seconds of speech) gives room to explain.",
+        "structure": "Signpost your reasoning with words like 'first', 'because', "
+                     "'however' and 'overall'.",
+        "examples": "Add a concrete example or a specific figure from your own experience.",
+    }
+    for c in criteria:
+        if not c.metric.is_available or c.metric.value is None:
+            continue
+        if c.metric.value >= STRENGTH_THRESHOLD:
+            strengths.append(_STRENGTH_TEXT[c.key])
+        elif c.metric.value < IMPROVE_THRESHOLD:
+            improvements.append(tips[c.key])
+    return strengths, improvements
 
 
 def evaluate_answer(question: Question, transcript: Optional[str]) -> AnswerResult:

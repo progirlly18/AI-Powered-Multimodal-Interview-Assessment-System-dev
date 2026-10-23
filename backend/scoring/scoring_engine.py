@@ -22,6 +22,7 @@ from typing import Iterable, Optional
 
 from backend.core.results import (
     AnswerResult,
+    CriterionScore,
     Metric,
     ScoreBreakdown,
     ScoreComponent,
@@ -60,9 +61,7 @@ PACE_PENALTY = 10.0
 PACE_MIN_WPM = 90.0
 PACE_MAX_WPM = 170.0
 
-# Answer-content rule (unchanged from the original answer evaluator).
-RELEVANCE_WEIGHT = 0.40
-COVERAGE_WEIGHT = 0.60
+# Answer content is a weighted rubric (data/rubric.json, docs/SCORING.md).
 
 
 def clamp_0_100(value: float) -> float:
@@ -99,19 +98,26 @@ def delivery_score(wpm: Metric, filler_count: int) -> Metric:
     return Metric.available(name, clamp_0_100(score))
 
 
-def answer_score(relevance: Metric, coverage: Metric) -> Metric:
-    """Answer content = 0.4 x topic relevance + 0.6 x concept coverage."""
+def rubric_answer_score(criteria: list[CriterionScore]) -> Metric:
+    """Answer content = sum of weight x criterion score over the rubric.
+
+    Every criterion must be available: they are all derived from the same
+    transcript, so a missing one means the evaluation itself failed.
+    """
     name = "Answer content"
-    for metric in (relevance, coverage):
-        _check_range(metric)
-        if not metric.is_available:
-            return Metric(
-                name=name,
-                status=metric.status,
-                reason=f"{metric.name}: {metric.reason}",
-            )
-    assert relevance.value is not None and coverage.value is not None
-    value = RELEVANCE_WEIGHT * relevance.value + COVERAGE_WEIGHT * coverage.value
+    if not criteria:
+        return Metric.unavailable(name, "No rubric criteria were evaluated")
+    total_weight = sum(c.weight for c in criteria)
+    if not math.isclose(total_weight, 1.0, abs_tol=1e-6):
+        raise ScoringInputError(f"Rubric weights must sum to 1, got {total_weight:.3f}")
+    value = 0.0
+    for c in criteria:
+        _check_range(c.metric)
+        if not c.metric.is_available:
+            return Metric(name=name, status=c.metric.status,
+                          reason=f"{c.label}: {c.metric.reason}")
+        assert c.metric.value is not None
+        value += c.weight * c.metric.value
     return Metric.available(name, clamp_0_100(value))
 
 
@@ -251,10 +257,11 @@ def build_suggestions(
         tips.append("Try pausing silently instead of saying 'um' or 'uh'.")
 
     if answer.answer_score.is_available and answer.answer_score.value is not None:
-        if answer.answer_score.value < 60 and answer.feedback:
-            tips.append(answer.feedback)
+        tips.extend(answer.improvements)
         weak = [name for name, value in answer.concept_scores.items() if value == 0]
-        if weak:
+        # The rubric's coverage tip already names missing concepts; don't repeat them.
+        coverage_tip = any(t.startswith("Cover the expected points") for t in answer.improvements)
+        if weak and not coverage_tip:
             tips.append("Points you could cover next time: " + ", ".join(weak) + ".")
 
     if not tips:

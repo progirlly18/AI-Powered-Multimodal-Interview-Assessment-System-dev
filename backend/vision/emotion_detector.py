@@ -44,14 +44,31 @@ def preprocess(frame_bgr: np.ndarray, bbox: BBox) -> np.ndarray:
     return np.expand_dims(preprocess_input(crop), axis=0)
 
 
-def predict_emotion(model: Any, frame_bgr: np.ndarray, bbox: BBox) -> tuple[str, float]:
-    """(label, softmax confidence) for the face in ``bbox``."""
+def validate_probabilities(probs: Any) -> np.ndarray:
+    """Check that ``probs`` is a 7-class probability vector; return it as float64."""
+    arr = np.asarray(probs, dtype=np.float64).reshape(-1)
+    if arr.shape != (len(EMOTION_LABELS),):
+        raise ValueError(f"Expected {len(EMOTION_LABELS)} class probabilities, got shape {arr.shape}")
+    if not np.all(np.isfinite(arr)) or np.any(arr < -1e-6) or not np.isclose(arr.sum(), 1.0, atol=1e-3):
+        raise ValueError("Emotion model output is not a probability distribution")
+    return np.clip(arr, 0.0, 1.0)
+
+
+def emotion_probabilities(model: Any, frame_bgr: np.ndarray, bbox: BBox) -> np.ndarray:
+    """Softmax output of the expression model for the face in ``bbox``."""
     batch = preprocess(frame_bgr, bbox)
     # model.predict() measured ~310 ms per call here; calling the model
     # directly measured ~1010 ms (scripts/benchmark.py, 2026-10-19), so keep predict().
-    probs = np.asarray(model.predict(batch, verbose=0))[0]
-    if probs.shape != (len(EMOTION_LABELS),) or not np.all(np.isfinite(probs)):
-        raise ValueError(f"Unexpected emotion model output shape {probs.shape}")
+    return validate_probabilities(np.asarray(model.predict(batch, verbose=0))[0])
+
+
+def predict_emotion(model: Any, frame_bgr: np.ndarray, bbox: BBox) -> tuple[str, float]:
+    """(label, softmax probability) for the face in ``bbox``.
+
+    The probability is the model's own softmax value. It is not calibrated:
+    0.8 does not mean the label is right 80% of the time.
+    """
+    probs = emotion_probabilities(model, frame_bgr, bbox)
     idx = int(np.argmax(probs))
     return EMOTION_LABELS[idx], float(probs[idx])
 

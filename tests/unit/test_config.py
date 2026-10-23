@@ -61,10 +61,18 @@ def test_env_example_has_no_secrets():
     assignments = [l for l in lines if "=" in l and not l.lstrip().startswith("#")]
     assert assignments, "expected placeholder assignments"
     for line in assignments:
-        name = line.split("=", 1)[0].upper()
-        assert name.startswith("INTERVIEW_AI_")
-        for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"):
-            assert word not in name
+        name, value = (part.strip() for part in line.split("=", 1))
+        assert name.upper().startswith("INTERVIEW_AI_")
+        # Secret-like settings may be listed, but only as empty placeholders.
+        if any(word in name.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+            assert value == "", f"{name} must be an empty placeholder"
+
+
+def test_secrets_file_is_ignored_and_example_has_no_real_password():
+    text = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert ".streamlit/secrets.toml" in text
+    example = (ROOT / ".streamlit" / "secrets.toml.example").read_text(encoding="utf-8")
+    assert 'smtp_password = "your 16-character app password"' in example
 
 
 def test_gitignore_covers_local_data():

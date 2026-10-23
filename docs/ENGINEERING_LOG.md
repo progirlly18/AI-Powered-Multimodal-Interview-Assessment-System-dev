@@ -111,3 +111,51 @@ transcripts or recordings are recorded here.
    inherited from cvzone/mediapipe); cvzone is no longer used at runtime and could be
    removed after testing.
 7. Nothing committed: awaiting owner approval.
+
+## 2026-10-23 — HUMAN NEXT redesign (`feature/human-next-ui`, from `1bdd3d2`)
+
+### What changed
+- **Visual identity:** `frontend/theme.py` (owner's palette, glass cards, gradient hero,
+  status chips, reduced-motion support, no external fonts) and `frontend/components.py`
+  (escaped HTML pieces). Streamlit `[theme]` set to match. The reference image mentioned in
+  the brief was not received; the design follows the written palette and direction.
+- **Pages:** landing; 3-step setup (configure with difficulty filter and optional name,
+  system check with one-frame camera preview, consent); two-column live console; answer
+  review; results dashboard; history.
+- **Answer rubric** (`data/rubric.json`, `backend/ai/rubric.py`, `text_features.py`):
+  relevance, coverage, elaboration, structure, examples, each with an explanation,
+  plus strengths and improvements. Replaces `0.4·relevance + 0.6·coverage`
+  (documented change; weights provisional, not fitted).
+- **Expression pipeline:** probabilities validated; model sampled at most once per
+  `INTERVIEW_AI_EMOTION_INTERVAL` (default 1 s; it costs ~310 ms); 3 s smoothing kept
+  separate from raw output; never scored.
+- **Multiple faces:** landmarker detects up to 2; frames are counted, with a live warning and a result warning.
+- **Persistence/export:** `SessionRecord` → SQLite history (`instance/history.db`), CSV,
+  and an HTML report (print to PDF). Transcripts are excluded unless the user opts in. No new dependencies.
+
+### Verification
+- Fast suite: 265 passed (incl. 7 headless UI tests).
+- Real app: landing, setup and system check rendered; all 5 real models loaded (face
+  landmarker 50.9 s, emotion 4.6 s, Whisper 18.4 s, MiniLM 42.7 s, YAMNet 13.5 s on this run).
+- Console, review, dashboard and history were inspected visually through a throwaway
+  harness (scratch folder, not in the repo) that fed the app the test-suite fakes. Its
+  numbers are synthetic; it was used only to check the layout. Found and fixed: unequal card
+  heights, wrapped run timeline, controls below the fold, heading anchor icons,
+  duplicated "missing concepts" recommendation.
+- Not verified: real webcam and microphone (would turn devices on unattended). The owner's
+  own app session was running on port 8501 with the system Python and was left untouched.
+
+## 2026-10-23 — Email-code sign-in (`feature/human-next-ui`)
+
+- Owner chose passwordless email codes (over Google OIDC or local-only checks) so that
+  only inbox owners can sign in. Standard library only (`smtplib`, `secrets`, `hashlib`,
+  `sqlite3`); no new dependencies.
+- `backend/auth/`: address rules (format, reserved, disposable list, optional allow-list),
+  salted-hash codes (10 min, single use, 5 tries), rate limits (60 s, 5/hour/address,
+  10/browser session), SMTP mailer, `AuthService`, settings from env or secrets.toml.
+- Gate in `frontend/app.py` before every page. The app **fails closed** if SMTP is not
+  configured; `INTERVIEW_AI_REQUIRE_SIGN_IN=false` must be set explicitly to disable it.
+- History is now per owner (migration adds an `owner` column; legacy rows are hidden).
+- Tests: auth unit tests, a real SMTP conversation against a local test server, and
+  headless UI tests of the gate.
+- Not verified: delivery through a real provider (requires the owner's SMTP credentials).

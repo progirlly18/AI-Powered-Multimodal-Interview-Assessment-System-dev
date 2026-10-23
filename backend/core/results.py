@@ -99,6 +99,7 @@ class VisionResult:
     frames_captured: int = 0
     frames_analysed: int = 0
     frames_with_face: int = 0
+    frames_multiple_faces: int = 0
     face_presence: Metric = field(
         default_factory=lambda: Metric.unavailable("Face in view", "Not measured", "%")
     )
@@ -143,6 +144,17 @@ class SpeechResult:
 
 
 @dataclass
+class CriterionScore:
+    """One rubric criterion with its weight and the reason for its score."""
+
+    key: str
+    label: str
+    metric: Metric
+    weight: float
+    explanation: str
+
+
+@dataclass
 class AnswerResult:
     """Content evaluation of one transcribed answer."""
 
@@ -164,6 +176,9 @@ class AnswerResult:
     )
     concept_scores: dict[str, int] = field(default_factory=dict)
     feedback: Optional[str] = None
+    criteria: list[CriterionScore] = field(default_factory=list)
+    strengths: list[str] = field(default_factory=list)
+    improvements: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -57,6 +57,8 @@ _RUN_LOCK = threading.Lock()
 
 MIN_DURATION_S = 5
 MAX_DURATION_S = 300
+# Analyses kept in live snapshots: ~10 s at the default 0.33 s interval.
+RECENT_WINDOW = 30
 
 
 class CancelledError(Exception):
@@ -114,7 +116,7 @@ class LiveStatus:
         frame, analysis, recent = None, None, []
         if vision is not None and not vision.released:
             frame, analysis = vision.snapshot()
-            recent = vision.recent_analyses(6)
+            recent = vision.recent_analyses(RECENT_WINDOW)
         return LiveSnapshot(state, message, seconds, frame, analysis, stage, recent)
 
 
@@ -195,7 +197,8 @@ class InterviewService:
             emotion_provider = lambda: self.registry.get("emotion")  # noqa: E731
         except ModelLoadError as exc:
             warnings.append(f"Facial expression estimates are off: {exc}")
-        return FaceAnalyzer(lambda: self.registry.get("face_mesh"), emotion_provider)
+        return FaceAnalyzer(lambda: self.registry.get("face_mesh"), emotion_provider,
+                            emotion_interval_s=self.settings.emotion_interval_s)
 
     # ---------------- main entry point ----------------
     def run_question(
@@ -372,6 +375,10 @@ class InterviewService:
             warnings.append(speech.background_note)
         if vision_result.reason and vision_result.status is Status.AVAILABLE:
             warnings.append(vision_result.reason)
+        if vision_result.frames_with_face and \
+                vision_result.frames_multiple_faces / vision_result.frames_with_face > 0.2:
+            warnings.append("More than one face was in view for part of the answer; "
+                            "camera measurements used only one face.")
         timings["processing_s"] = self._clock() - t_proc
 
         return QuestionResult(

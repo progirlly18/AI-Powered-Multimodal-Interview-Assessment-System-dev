@@ -24,7 +24,7 @@ Code: `backend/scoring/scoring_engine.py`. Tests:
 
 | Key | Component | Inputs (valid range) | Rule | Weight |
 |---|---|---|---|---|
-| `answer` | Answer content | topic relevance 0–100, concept coverage 0–100 | `0.4 × relevance + 0.6 × coverage` | **50** (required) |
+| `answer` | Answer content | five rubric criteria, each 0–100 (§2.1) | `Σ weight × criterion` (weights in `data/rubric.json`, summing to 1) | **50** (required) |
 | `delivery` | Speaking delivery | speaking pace (wpm), hesitation fillers (≥ 0) | `100 − 3 × fillers − (10 if pace < 90 or > 170 wpm)`, clamped to 0–100 | 20 |
 | `eye_contact` | Looking at the camera | % of face frames with gaze "Looking Center" | percentage as is | 15 |
 | `head_facing` | Facing the camera | % of face frames with head "Center" | percentage as is | 15 |
@@ -33,7 +33,29 @@ Code: `backend/scoring/scoring_engine.py`. Tests:
 - **Facial-expression label.** The EfficientNet model reports about 51% validation accuracy on FER2013 (posed lab images), and "smiling" is not a validated sign of a good answer.
 - **Background-sound label (YAMNet).** The original rule rewarded rain or birdsong and penalised a quiet room.
 
-### 2.1 Answer content inputs
+### 2.1 Answer content: the rubric
+
+The answer-content score is a weighted rubric. The weights are configured per question category in `data/rubric.json`, which is validated when loaded: every criterion must be present, weights must be ≥ 0, and they must sum to 1.
+
+| Criterion | What it measures | Rule | Technical | Behavioural |
+|---|---|---|---|---|
+| Relevance | how on-topic the answer is | semantic similarity, below | 25% | 25% |
+| Concept coverage | expected concepts demonstrated | see below | 45% | 35% |
+| Elaboration | how fully the answer is developed | `min(100, 100 × words / 60)` | 10% | 10% |
+| Structure | visible reasoning | kinds of connectives found — sequence (*first, then, finally*), cause (*because, therefore*), contrast (*however, but*), summary (*overall, in summary*): 0 kinds → 0, 1 → 50, 2 → 80, 3+ → 100 | 10% | 10% |
+| Examples & evidence | concrete detail | example phrases (*for example, such as, in my project, I built…*) and specific figures; 0 signals → 0, 1 → 70, 2+ → 100 | 10% | 20% |
+
+Each criterion carries a one-line explanation of exactly what was found (e.g. "0 of 3 expected concepts stated explicitly, 1 by paraphrase"; "43 words — short of the ~60 words of a fully developed answer").
+- **Strengths** are criteria scoring ≥ 75.
+- **Improvements** are criteria scoring < 50, each with a concrete tip.
+- **Behavioural (HR) questions** weight examples more heavily, because concrete evidence is what such questions ask for.
+
+**Limits of the text heuristics:**
+- Elaboration, structure and examples count visible patterns in English text. They reward signposting and concrete detail, but a speaker can use the words without the substance.
+- They do not measure correctness or reasoning quality, and none of them measure vocal tone.
+- Relevance and concept coverage appear in the rubric once each, and nowhere else in the score, so they are not double-counted.
+
+The criteria are computed as follows.
 
 - **Topic relevance** = `clamp(cosine(question, answer), 0, 1) × 100`, using `all-MiniLM-L6-v2` embeddings.
   - It measures how on-topic the answer is. It is **uncalibrated**: no human-rated data maps similarity to answer quality.
@@ -122,10 +144,11 @@ At 80 wpm with no fillers:
 100 − 10 = 90
 ```
 
-**Example 5: answer content.** Relevance 50, coverage 75:
+**Example 5: answer content (technical rubric).** Relevance 60, coverage 80, elaboration 100, structure 50, examples 0:
 ```
-0.4×50 + 0.6×75 = 65
+0.25×60 + 0.45×80 + 0.10×100 + 0.10×50 + 0.10×0 = 15 + 36 + 10 + 5 + 0 = 66
 ```
+Until 2026-10-23 the answer-content rule was `0.4 × relevance + 0.6 × coverage`. It was replaced by the rubric so that structure, elaboration and examples are visible and explained. Like the old weights, these are not fitted to data.
 
 **Regression.** No camera and no microphone used to score **100/100** on the teammate branch, because its fallback values were the top value of every rule. Now the overall score is withheld.
 

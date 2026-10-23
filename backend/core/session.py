@@ -3,10 +3,12 @@ Interview session: which page the user is on, which questions are asked,
 and the outcome of each. Pure Python so the whole flow is unit-testable.
 
     WELCOME -> SETUP -> READINESS -> CONSENT -> QUESTION <-> REVIEW -> SUMMARY
+    WELCOME / SUMMARY -> HISTORY
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -16,6 +18,7 @@ from backend.core.states import InvalidTransitionError, RunState
 
 class Stage(str, Enum):
     WELCOME = "welcome"
+    HISTORY = "history"
     SETUP = "setup"
     READINESS = "readiness"
     CONSENT = "consent"
@@ -25,14 +28,17 @@ class Stage(str, Enum):
 
 
 STAGE_TRANSITIONS: dict[Stage, frozenset[Stage]] = {
-    Stage.WELCOME: frozenset({Stage.SETUP}),
+    Stage.WELCOME: frozenset({Stage.SETUP, Stage.HISTORY}),
+    Stage.HISTORY: frozenset({Stage.WELCOME, Stage.SETUP}),
     Stage.SETUP: frozenset({Stage.READINESS, Stage.WELCOME}),
     Stage.READINESS: frozenset({Stage.CONSENT, Stage.SETUP}),
     Stage.CONSENT: frozenset({Stage.QUESTION, Stage.SETUP}),
     Stage.QUESTION: frozenset({Stage.REVIEW, Stage.SETUP}),
     Stage.REVIEW: frozenset({Stage.QUESTION, Stage.SUMMARY, Stage.SETUP}),
-    Stage.SUMMARY: frozenset({Stage.SETUP, Stage.WELCOME}),
+    Stage.SUMMARY: frozenset({Stage.SETUP, Stage.WELCOME, Stage.HISTORY}),
 }
+
+MAX_CANDIDATE_LENGTH = 60
 
 MAX_QUESTIONS = 10
 
@@ -49,6 +55,10 @@ class InterviewSession:
     # question_id -> RunOutcome (kept as Any to avoid importing the service)
     outcomes: dict[str, Any] = field(default_factory=dict)
     attempts: dict[str, int] = field(default_factory=dict)
+    session_id: str = ""
+    created_at: str = ""
+    candidate: Optional[str] = None
+    saved_to_history: bool = False
 
     # ---------------- transitions ----------------
     def _go(self, target: Stage) -> None:
@@ -64,8 +74,11 @@ class InterviewSession:
     def back_to_welcome(self) -> None:
         self._go(Stage.WELCOME)
 
+    def open_history(self) -> None:
+        self._go(Stage.HISTORY)
+
     def configure(self, role: str, question_ids: list[str], duration_s: int,
-                  use_camera: bool) -> None:
+                  use_camera: bool, candidate: Optional[str] = None) -> None:
         if self.stage is not Stage.SETUP:
             raise InvalidTransitionError("The interview can only be configured on the setup page.")
         if not role:
@@ -76,6 +89,15 @@ class InterviewSession:
             raise ValueError(f"Choose at most {MAX_QUESTIONS} questions.")
         if len(set(question_ids)) != len(question_ids):
             raise ValueError("Each question can be chosen only once.")
+        name = (candidate or "").strip()
+        if len(name) > MAX_CANDIDATE_LENGTH:
+            raise ValueError(f"Keep the name under {MAX_CANDIDATE_LENGTH} characters.")
+        from backend.storage.records import new_session_id
+
+        self.candidate = name or None
+        self.session_id = new_session_id()
+        self.created_at = time.strftime("%Y-%m-%d %H:%M")
+        self.saved_to_history = False
         self.role = role
         self.question_ids = list(question_ids)
         self.duration_s = int(duration_s)
@@ -105,6 +127,14 @@ class InterviewSession:
         self.index = 0
         self.consent_given = False
         self.stage = Stage.SETUP
+
+    def go_home(self) -> None:
+        """Back to the landing page from any page; clears the current session."""
+        self.outcomes = {}
+        self.attempts = {}
+        self.index = 0
+        self.consent_given = False
+        self.stage = Stage.WELCOME
 
     # ---------------- questions ----------------
     @property

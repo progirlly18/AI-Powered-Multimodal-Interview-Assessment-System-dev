@@ -42,8 +42,8 @@ class FaceLandmarker:
         self._detector = vision.FaceLandmarker.create_from_options(options)
         self._last_timestamp_ms = -1
 
-    def detect(self, frame_bgr: np.ndarray) -> Optional[Landmarks]:
-        """Landmarks of the first face in pixel coordinates, or None."""
+    def detect_all(self, frame_bgr: np.ndarray) -> list[Landmarks]:
+        """Landmarks of every detected face (up to ``max_faces``), in pixels."""
         import cv2
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -52,10 +52,14 @@ class FaceLandmarker:
         timestamp = max(self._last_timestamp_ms + 1, int(time.monotonic() * 1000))
         self._last_timestamp_ms = timestamp
         result = self._detector.detect_for_video(image, timestamp)
-        if not result.face_landmarks:
-            return None
         h, w = frame_bgr.shape[:2]
-        return [(int(lm.x * w), int(lm.y * h)) for lm in result.face_landmarks[0]]
+        return [[(int(lm.x * w), int(lm.y * h)) for lm in face]
+                for face in (result.face_landmarks or [])]
+
+    def detect(self, frame_bgr: np.ndarray) -> Optional[Landmarks]:
+        """Landmarks of the first face, or None."""
+        faces = self.detect_all(frame_bgr)
+        return faces[0] if faces else None
 
     def close(self) -> None:
         self._detector.close()

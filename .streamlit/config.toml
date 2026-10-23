@@ -12,6 +12,15 @@ runOnSave = false
 [browser]
 gatherUsageStats = false
 
+[theme]
+# HUMAN NEXT palette (see frontend/theme.py). No external fonts are loaded.
+base = "dark"
+primaryColor = "#36C5FF"
+backgroundColor = "#07080D"
+secondaryBackgroundColor = "#111522"
+textColor = "#F4F7FF"
+font = "sans serif"
+
 [client]
 # Hide Streamlit's developer error details from normal users;
 # full tracebacks are written to logs/app.log instead.

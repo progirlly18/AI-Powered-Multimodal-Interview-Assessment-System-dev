@@ -28,12 +28,16 @@ class Settings:
     # Seconds between vision analyses (the original code analysed every
     # 10th frame, i.e. about 3 times per second at 30 fps).
     vision_interval_s: float = 0.33
+    # The expression model costs ~310 ms per call, so it runs less often.
+    emotion_interval_s: float = 1.0
     # Maximum refresh rate of the live video in the browser.
     display_fps: float = 10.0
     countdown_s: int = 3
     keep_recordings: bool = False
     recordings_dir: Path = PROJECT_ROOT / "recordings"
     log_dir: Path = PROJECT_ROOT / "logs"
+    # Local SQLite file for saved interview summaries (git-ignored).
+    history_path: Path = PROJECT_ROOT / "instance" / "history.db"
     emotion_model_path: Path = PROJECT_ROOT / "backend" / "models" / "best_model.keras"
     # MediaPipe FaceLandmarker model (478 landmarks including irises).
     face_landmarker_path: Path = PROJECT_ROOT / "face_landmarker.task"
@@ -92,14 +96,17 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         )
 
     recordings_dir = env.get("INTERVIEW_AI_RECORDINGS_DIR", "").strip()
+    history_path = env.get("INTERVIEW_AI_HISTORY_PATH", "").strip()
 
     return Settings(
         camera_index=_int(env, "INTERVIEW_AI_CAMERA_INDEX", 0, 0, 9),
         whisper_model=whisper_model,
         vision_interval_s=_float(env, "INTERVIEW_AI_VISION_INTERVAL", 0.33, 0.05, 2.0),
+        emotion_interval_s=_float(env, "INTERVIEW_AI_EMOTION_INTERVAL", 1.0, 0.0, 10.0),
         display_fps=_float(env, "INTERVIEW_AI_DISPLAY_FPS", 10.0, 1.0, 30.0),
         countdown_s=_int(env, "INTERVIEW_AI_COUNTDOWN", 3, 0, 10),
         keep_recordings=_bool(env, "INTERVIEW_AI_KEEP_RECORDINGS", False),
         recordings_dir=Path(recordings_dir) if recordings_dir else Settings.recordings_dir,
         language=env.get("INTERVIEW_AI_LANGUAGE", "").strip() or "en",
+        history_path=Path(history_path) if history_path else Settings.history_path,
     )

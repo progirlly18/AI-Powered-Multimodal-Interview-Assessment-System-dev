@@ -68,6 +68,16 @@ def test_yamnet_labels_parse_quoted_names(registry):
 def test_face_landmarker_on_blank_frame(registry):
     landmarker = registry.get("face_mesh")
     assert landmarker.detect(np.zeros((480, 640, 3), np.uint8)) is None
+    assert landmarker.detect_all(np.zeros((480, 640, 3), np.uint8)) == []
+
+
+def test_rubric_with_real_model_explains_every_criterion(registry):
+    q = qb.get_question("Machine Learning Engineer", 2)
+    r = AnswerEvaluator(lambda: registry.get("sentence")).evaluate(q, SPOKEN)
+    assert [c.key for c in r.criteria] == ["relevance", "coverage", "elaboration",
+                                           "structure", "examples"]
+    assert all(c.explanation and c.metric.is_available for c in r.criteria)
+    assert r.answer_score.value == pytest.approx(sum(c.weight * c.metric.value for c in r.criteria))
 
 
 def test_emotion_model_output(registry):
