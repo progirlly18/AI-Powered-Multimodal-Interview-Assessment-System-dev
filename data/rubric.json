@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "description": "Answer-quality rubric. Weights per question category must sum to 1. See docs/SCORING.md.",
+  "weights": {
+    "technical": {
+      "relevance": 0.25,
+      "coverage": 0.45,
+      "elaboration": 0.10,
+      "structure": 0.10,
+      "examples": 0.10
+    },
+    "behavioural": {
+      "relevance": 0.25,
+      "coverage": 0.35,
+      "elaboration": 0.10,
+      "structure": 0.10,
+      "examples": 0.20
+    }
+  },
+  "elaboration": {
+    "target_words": 60
+  }
+}

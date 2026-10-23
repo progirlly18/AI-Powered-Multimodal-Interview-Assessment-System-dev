@@ -1,6 +1,33 @@
-tensorflow
-opencv-python
-mediapipe
-numpy
-matplotlib
-pillow
+# Direct runtime dependencies, pinned to the versions in the working
+# development environment (Python 3.11.9, Windows 11).
+# For a fully reproducible install use requirements-lock.txt instead.
+
+# Web application
+streamlit==1.61.1
+
+# Vision
+tensorflow==2.21.0
+tf_keras==2.21.0
+opencv-python==5.0.0.93
+mediapipe==1.0.0
+cvzone==2.0.0
+pillow==12.3.0
+
+# Numerical
+numpy==2.4.6
+scipy==1.17.1
+scikit-learn==1.9.0
+matplotlib==3.11.1
+
+# Audio and speech
+sounddevice==0.5.5
+librosa==0.11.0
+openai-whisper==20250625
+tensorflow-hub==0.16.1
+torch==2.13.0
+
+# NLP
+sentence-transformers==5.7.0
+
+# tensorflow-hub 0.16.1 imports pkg_resources, removed in setuptools 81.
+setuptools==80.9.0

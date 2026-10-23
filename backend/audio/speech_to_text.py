@@ -1,53 +1,37 @@
-import whisper
-from collections import Counter
+"""
+Developer utility: transcribe a WAV file with Whisper.
 
-print("Loading Whisper model...")
+    python -m backend.audio.speech_to_text path\\to\\clip.wav
 
-model = whisper.load_model("base")
+Reads 16 kHz mono int16 WAV files directly (no FFmpeg needed).
+"""
 
-print("Model loaded!")
+import argparse
 
-audio_file = "sample.wav"
+import numpy as np
+from scipy.io.wavfile import read
 
-result = model.transcribe(audio_file)
+from backend.audio.speech_metrics import FILLERS, count_phrases
+from backend.core.models import get_registry
 
-transcript = result["text"]
 
-print("\nTranscript:")
-print(transcript)
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path")
+    args = parser.parse_args()
 
-# -----------------------------
-# Filler Word Detection
-# -----------------------------
+    rate, audio = read(args.path)
+    if rate != 16000 or audio.dtype != np.int16:
+        raise SystemExit("Expected a 16 kHz int16 WAV file.")
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    result = get_registry().get("whisper").transcribe(
+        audio.astype(np.float32) / 32768.0, fp16=False
+    )
+    transcript = result["text"].strip()
+    print("\nTranscript:\n" + transcript)
+    print("\nFillers:", count_phrases(transcript, FILLERS) or "none")
 
-fillers = [
-    "um",
-    "uh",
-    "like",
-    "actually",
-    "basically",
-    "you know",
-    "so"
-]
 
-words = transcript.lower().split()
-
-counter = Counter(words)
-
-print("\n--------------------------")
-print("FILLER WORDS")
-print("--------------------------")
-
-total = 0
-
-for filler in fillers:
-
-    count = counter[filler]
-
-    if count > 0:
-        print(f"{filler:<12}: {count}")
-
-    total += count
-
-print("--------------------------")
-print("Total fillers:", total)
+if __name__ == "__main__":
+    main()

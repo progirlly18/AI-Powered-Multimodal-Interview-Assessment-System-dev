@@ -1,55 +1,51 @@
-from cvzone.FaceMeshModule import FaceMeshDetector
+"""
+Horizontal gaze estimate from iris position (heuristic).
 
-# Create detector once
-detector = FaceMeshDetector(maxFaces=1)
+The ratio of each iris centre between the eye corners is averaged; below
+0.35 or above 0.65 counts as looking to one side. These thresholds have not
+been validated, the labels depend on whether the image is mirrored, and
+webcam gaze estimation is imprecise. Use it as a coaching hint only.
+"""
+
+from __future__ import annotations
+
+from typing import Sequence
+
+LEFT_IRIS, RIGHT_IRIS = 468, 473
+LEFT_EYE_OUTER, LEFT_EYE_INNER = 33, 133
+RIGHT_EYE_INNER, RIGHT_EYE_OUTER = 362, 263
+
+LOOKING_CENTER = "Looking Center"
+LOOKING_LEFT = "Looking Left"
+LOOKING_RIGHT = "Looking Right"
 
 
-def detect_eye_contact(frame):
-    """
-    Detect eye contact direction.
-
-    Returns:
-        direction (str)
-    """
-
-    img, faces = detector.findFaceMesh(frame, draw=False)
-
-    if not faces:
-        return "No Face"
-
-    face = faces[0]
-
-    # Iris centers
-    left_iris = face[468]
-    right_iris = face[473]
-
-    # Eye corners
-    left_eye_left = face[33]
-    left_eye_right = face[133]
-
-    right_eye_left = face[362]
-    right_eye_right = face[263]
-
-    # Horizontal ratios
-    left_ratio = (
-        (left_iris[0] - left_eye_left[0]) /
-        (left_eye_right[0] - left_eye_left[0] + 1e-6)
+def gaze_ratio(face: Sequence[Sequence[float]]) -> float:
+    if len(face) <= RIGHT_IRIS:
+        raise ValueError("Iris landmarks are missing (need 478 landmarks).")
+    left = (face[LEFT_IRIS][0] - face[LEFT_EYE_OUTER][0]) / (
+        face[LEFT_EYE_INNER][0] - face[LEFT_EYE_OUTER][0] + 1e-6
     )
-
-    right_ratio = (
-        (right_iris[0] - right_eye_left[0]) /
-        (right_eye_right[0] - right_eye_left[0] + 1e-6)
+    right = (face[RIGHT_IRIS][0] - face[RIGHT_EYE_INNER][0]) / (
+        face[RIGHT_EYE_OUTER][0] - face[RIGHT_EYE_INNER][0] + 1e-6
     )
+    return (left + right) / 2
 
-    ratio = (left_ratio + right_ratio) / 2
 
+def eye_direction_from_landmarks(face: Sequence[Sequence[float]]) -> str:
+    ratio = gaze_ratio(face)
     if ratio < 0.35:
-        direction = "Looking Right"
+        return LOOKING_RIGHT
+    if ratio > 0.65:
+        return LOOKING_LEFT
+    return LOOKING_CENTER
 
-    elif ratio > 0.65:
-        direction = "Looking Left"
 
-    else:
-        direction = "Looking Center"
+def detect_eye_contact(frame) -> str:
+    """Legacy entry point: detect landmarks in ``frame`` and classify gaze."""
+    from backend.core.models import get_registry
 
-    return direction
+    face = get_registry().get("face_mesh").detect(frame)
+    if face is None:
+        return "No Face"
+    return eye_direction_from_landmarks(face)

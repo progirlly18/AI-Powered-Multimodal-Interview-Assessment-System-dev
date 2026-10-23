@@ -1,0 +1,27 @@
+# Streamlit settings for local use.
+# Do not disable enableXsrfProtection / enableCORS to make the app "work":
+# they protect the local server from requests made by other websites.
+
+[server]
+# Only accept connections from this computer.
+address = "localhost"
+enableXsrfProtection = true
+enableCORS = true
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+# HUMAN NEXT palette (see frontend/theme.py). No external fonts are loaded.
+base = "dark"
+primaryColor = "#36C5FF"
+backgroundColor = "#07080D"
+secondaryBackgroundColor = "#111522"
+textColor = "#F4F7FF"
+font = "sans serif"
+
+[client]
+# Hide Streamlit's developer error details from normal users;
+# full tracebacks are written to logs/app.log instead.
+showErrorDetails = "none"

@@ -1,80 +1,39 @@
-import tensorflow as tf
-import tensorflow_hub as hub
-import librosa
+"""
+Developer utility: show the dominant YAMNet sound class of a WAV file.
+
+    python -m backend.audio.sound_classifier path\\to\\clip.wav
+
+The label is informational. It is not evidence of malpractice: the
+original "possible external assistance" verdict for any speech-like sound
+was removed because the candidate's own voice is speech.
+"""
+
+import argparse
+
 import numpy as np
+from scipy.io.wavfile import read
 
-print("Loading YAMNet model...")
-
-model = hub.load("https://tfhub.dev/google/yamnet/1")
-
-print("Model loaded!")
-
-class_map_path = model.class_map_path().numpy().decode("utf-8")
-
-with open(class_map_path) as f:
-    labels = [line.strip().split(",")[2] for line in f.readlines()[1:]]
-
-waveform, sr = librosa.load("sample.wav", sr=16000)
-
-scores, embeddings, spectrogram = model(waveform)
-
-scores = scores.numpy()
-
-mean_scores = np.mean(scores, axis=0)
-
-predicted = np.argmax(mean_scores)
-
-label = labels[predicted]
-
-confidence = float(mean_scores[predicted])
-
-print("\nDetected Sound :", label)
-print("Confidence     :", round(confidence,3))
+from backend.audio.speech_metrics import background_note
+from backend.core.models import get_registry
 
 
-# -------------------------
-# Decision Engine
-# -------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path")
+    args = parser.parse_args()
 
-NATURAL = [
-    "Rain",
-    "Thunder",
-    "Wind",
-    "Water",
-    "Ocean",
-    "Stream",
-    "Bird",
-    "Bird vocalization",
-    "Insect",
-    "Cricket",
-    "Thunderstorm"
-]
+    rate, audio = read(args.path)
+    if rate != 16000 or audio.dtype != np.int16:
+        raise SystemExit("Expected a 16 kHz int16 WAV file.")
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    model, labels = get_registry().get("yamnet")
+    scores, _, _ = model(audio.astype(np.float32) / 32768.0)
+    mean_scores = np.mean(scores.numpy(), axis=0)
+    idx = int(np.argmax(mean_scores))
+    print(f"Detected sound: {labels[idx]} (confidence {mean_scores[idx]:.3f})")
+    print(background_note(labels[idx], float(mean_scores[idx])) or "No competing background sound flagged.")
 
-SUSPICIOUS = [
-    "Speech",
-    "Conversation",
-    "Narration",
-    "Television",
-    "Music",
-    "Typing",
-    "Keyboard",
-    "Mouse click",
-    "Whispering"
-]
 
-print("\nDecision")
-
-if any(x.lower() in label.lower() for x in NATURAL):
-
-    print("✅ Natural Background Sound")
-    print("No malpractice detected.")
-
-elif any(x.lower() in label.lower() for x in SUSPICIOUS):
-
-    print("🚨 Possible External Assistance")
-    print("Review required.")
-
-else:
-
-    print("⚠ Unknown Background Sound")
-    print("Manual review recommended.")
+if __name__ == "__main__":
+    main()
